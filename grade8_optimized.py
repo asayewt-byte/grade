@@ -90,14 +90,18 @@ def queue_db_write(fn):
 _db_conn = None
 _db_lock = asyncio.Lock()
 DB_CONNECT_TIMEOUT = 10
+DB_PATH = os.getenv("BOT_DB_PATH", "/data/bot_data.db" if os.name != "nt" else "bot_data.db")
 
 async def get_db():
     global _db_conn
     if _db_conn is None:
         async with _db_lock:
             if _db_conn is None:
+                db_dir = os.path.dirname(DB_PATH)
+                if db_dir:
+                    os.makedirs(db_dir, exist_ok=True)
                 _db_conn = await asyncio.wait_for(
-                    aiosqlite.connect("bot_data.db", timeout=DB_CONNECT_TIMEOUT),
+                    aiosqlite.connect(DB_PATH, timeout=DB_CONNECT_TIMEOUT),
                     timeout=DB_CONNECT_TIMEOUT + 2
                 )
                 await _db_conn.execute("PRAGMA journal_mode=WAL")
@@ -471,10 +475,12 @@ async def load_subscribers():
 async def save_user_data(user_id, username=None, first_name=None, last_name=None, phone_number=None):
     try:
         ts = datetime.now().isoformat()
-        queue_db_write(lambda db: db.execute("INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, phone_number, registration_date, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, phone_number, ts, ts)))
-        queue_db_write(lambda db: db.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (user_id,)))
+        db = await get_db()
+        await db.execute("INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, phone_number, registration_date, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, phone_number, ts, ts))
+        await db.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (user_id,))
         if phone_number:
-            queue_db_write(lambda db: db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number)))
+            await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number))
+        await db.commit()
         return True
     except Exception as e:
         logger.error(f"Failed to save user {user_id}: {e}")
