@@ -121,6 +121,12 @@ async def request_phone_number(update, context):
     if bot_locked and user_id != ADMIN_CHAT_ID:
         await update.message.reply_text("⚠️ Bot is currently locked by admin. Please try again later.")
         return ConversationHandler.END
+    cached_phone = context.user_data.get('phone_number')
+    if user_id == ADMIN_CHAT_ID and cached_phone == "ADMIN_BYPASS":
+        await update_user_activity(user_id)
+        user_first_name = update.effective_user.first_name or "Admin"
+        await update.message.reply_text(escape_markdown_v2(f"እንኳን ደህና መጡ, {user_first_name}!\n\nየአስተዳደር ፈቃድ ተሰጥቷል\n\nPlease choose your language:"), reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
+        return REGION
     if user_id == ADMIN_CHAT_ID:
         logger.info(f"Admin {user_id} bypassing phone number requirement")
         user_data = await get_user_data(user_id)
