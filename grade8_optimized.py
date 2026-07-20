@@ -132,9 +132,6 @@ async def request_phone_number(update, context):
         user_data = await get_user_data(user_id)
         if not user_data:
             await save_user_data(user_id=user_id, username=update.effective_user.username, first_name=update.effective_user.first_name, last_name=update.effective_user.last_name, phone_number="ADMIN_BYPASS")
-            db = await get_db()
-            await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, "ADMIN_BYPASS"))
-            await db.commit()
         await load_user_data_to_context(user_id, context)
         await update_user_activity(user_id)
         user_first_name = update.effective_user.first_name or "Admin"
@@ -175,9 +172,6 @@ async def receive_phone_number(update, context):
         phone_number = contact.phone_number
         user = update.effective_user
         await save_user_data(user_id=user_id, username=user.username, first_name=user.first_name, last_name=user.last_name, phone_number=phone_number)
-        db = await get_db()
-        await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number))
-        await db.commit()
         context.user_data['phone_number'] = phone_number
         await update.message.reply_text("Thank you. Redirecting to main menu...", reply_markup=ReplyKeyboardRemove())
         full_name = update.effective_user.full_name or "(no name)"
@@ -253,6 +247,9 @@ _in_flight_fetches = {}
 _in_flight_lock = asyncio.Lock()
 _rate_limit_violations = {}
 _rate_limit_warned_windows = set()
+_active_request_tasks = {}
+_membership_cache = {}
+_membership_cache_ttl = 300
 
 async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False):
     if not zyte_api_key_runtime:
@@ -775,16 +772,27 @@ async def format_student_results(student_data: dict, bot_username: str = "", reg
 async def is_user_fully_member(update, context):
     try:
         user_id = update.effective_user.id
+        cached = _membership_cache.get(user_id)
+        if cached and time.time() - cached[1] <= _membership_cache_ttl:
+            return True
         for retry in range(3):
             try:
                 member = await asyncio.wait_for(context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id), timeout=5.0)
-                return member.status in ["member", "administrator", "creator"]
+                if member.status in ["member", "administrator", "creator"]:
+                    _membership_cache[user_id] = (True, time.time())
+                    return True
+                if member.status == "restricted" and getattr(member, "is_member", False):
+                    _membership_cache[user_id] = (True, time.time())
+                    return True
+                return False
             except (asyncio.TimeoutError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError):
                 if retry < 2:
                     await asyncio.sleep(0.5 * (retry + 1))
                     continue
+                logger.warning(f"Membership check timed out/network error for user {user_id} in {CHANNEL_ID}")
                 return False
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Membership check failed for user {user_id} in {CHANNEL_ID}: {e}")
                 return False
     except Exception:
         return False
@@ -863,6 +871,8 @@ async def get_today_lookups(user_id):
 
 async def _process_user_request(update, context):
     user_id = update.effective_user.id
+    current_task = asyncio.current_task()
+    _active_request_tasks[user_id] = current_task
     try:
         await asyncio.wait_for(_process_user_request_internal(update, context), timeout=REQUEST_TIMEOUT)
     except asyncio.TimeoutError:
@@ -871,12 +881,18 @@ async def _process_user_request(update, context):
             await update.message.reply_text(escape_markdown_v2("⏰ *Request timed out!*\n\n🔄 *Please try again in a moment*"), parse_mode='MarkdownV2')
         except Exception:
             pass
+    except asyncio.CancelledError:
+        logger.info(f"Request cancelled for user {user_id}")
+        raise
     except Exception as e:
         logger.error(f"Error in request processing: {e}")
         try:
             await update.message.reply_text(escape_markdown_v2("*An error occurred.*\n\nPlease try again later."), parse_mode='MarkdownV2')
         except Exception:
             pass
+    finally:
+        if _active_request_tasks.get(user_id) is current_task:
+            _active_request_tasks.pop(user_id, None)
 
 async def _process_user_request_internal(update, context):
     user_id = update.effective_user.id
@@ -977,6 +993,16 @@ async def _process_user_request_internal(update, context):
             pass
     finally:
         await decrement_concurrent_request(user_id)
+
+async def stop_fetch(update, context):
+    user_id = update.effective_user.id
+    current_task = _active_request_tasks.get(user_id)
+    if current_task and not current_task.done():
+        current_task.cancel()
+        await update.message.reply_text("🛑 Fetch stopped immediately.")
+        return ConversationHandler.END
+    await update.message.reply_text("ℹ️ No active fetch is running right now.")
+    return ConversationHandler.END
 
 def validate_registration(registration: str) -> bool:
     return re.match(r"^\d{6,10}$", registration) is not None
@@ -1226,6 +1252,7 @@ async def approve_membership(update, context):
     except Exception:
         pass
     if await is_user_fully_member(update, context):
+        _membership_cache[update.effective_user.id] = (True, time.time())
         await safe_edit_message(query, "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:", reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
         return REGION
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")], [InlineKeyboardButton("✅ I Joined", callback_data="approve_membership")]])
@@ -1347,6 +1374,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(approve_membership, pattern="^approve_membership$"))
     application.add_handler(CallbackQueryHandler(lambda u,c: None, pattern="^sponsor_click_"))
+    application.add_handler(CommandHandler("stop", stop_fetch))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_general_message))
     application.add_error_handler(error_handler)
 
