@@ -579,18 +579,22 @@ async def check_api_credit_status():
     try:
         session = await get_http_session()
         async with session.get("https://api.zyte.com/v1/account", headers=build_basic_auth_headers(zyte_api_key_runtime)) as resp:
-                if resp.status == 200:
-                    API_CREDIT_STATUS = "active"
-                    LAST_API_CHECK = datetime.now()
+                    if resp.status == 200:
+                        API_CREDIT_STATUS = "active"
+                        LAST_API_CHECK = datetime.now()
+                        logger.info("✅ Zyte API is active")
+                        return True
+                    if resp.status == 401:
+                        API_CREDIT_STATUS = "invalid_key"
+                        logger.error("❌ Zyte API key is invalid")
+                        return False
+                    if resp.status == 403:
+                        API_CREDIT_STATUS = "insufficient_credits"
+                        logger.error("❌ Zyte API has insufficient credits")
+                        return False
+                    API_CREDIT_STATUS = "unknown"
+                    logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
                     return True
-                if resp.status == 401:
-                    API_CREDIT_STATUS = "invalid_key"
-                    return False
-                if resp.status == 403:
-                    API_CREDIT_STATUS = "insufficient_credits"
-                    return False
-                API_CREDIT_STATUS = "unknown"
-                return True
     except Exception as e:
         logger.error(f"Error checking API credit status: {e}")
         API_CREDIT_STATUS = "error"
