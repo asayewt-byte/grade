@@ -260,7 +260,12 @@ async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False)
     last_error = None
     for attempt in range(ZYTE_RETRIES + 1):
         try:
-            async with session.post(ZYTE_PROXY_URL, json=payload, headers=zyte_headers) as resp:
+            per_attempt_timeout = aiohttp.ClientTimeout(
+                total=min(ZYTE_ATTEMPT_MAX_TIMEOUT, ZYTE_TOTAL_TIMEOUT + (attempt * 10)),
+                connect=ZYTE_CONNECT_TIMEOUT,
+                sock_read=min(55, ZYTE_TOTAL_TIMEOUT + (attempt * 8))
+            )
+            async with session.post(ZYTE_PROXY_URL, json=payload, headers=zyte_headers, timeout=per_attempt_timeout) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
                 body = b64decode(data.get("httpResponseBody", ""))
@@ -279,7 +284,7 @@ async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False)
         except Exception as e:
             last_error = f"zyte_error: {e}"
         if attempt < ZYTE_RETRIES:
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(1.25 ** (attempt + 1))
     return None, last_error
 
 REGION_BASE_URLS = {
@@ -298,8 +303,9 @@ PHONE_NUMBER = 100
 
 GLOBAL_SEMAPHORE = Semaphore(500)
 REQUEST_TIMEOUT = 90
-ZYTE_TOTAL_TIMEOUT = 35
+ZYTE_TOTAL_TIMEOUT = 45
 ZYTE_CONNECT_TIMEOUT = 10
+ZYTE_ATTEMPT_MAX_TIMEOUT = 60
 ZYTE_RETRIES = 1
 
 ADMIN_FEEDBACK_REPLY = 2000
@@ -775,25 +781,21 @@ async def is_user_fully_member(update, context):
         cached = _membership_cache.get(user_id)
         if cached and time.time() - cached[1] <= _membership_cache_ttl:
             return True
-        for retry in range(3):
-            try:
-                member = await asyncio.wait_for(context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id), timeout=5.0)
-                if member.status in ["member", "administrator", "creator"]:
-                    _membership_cache[user_id] = (True, time.time())
-                    return True
-                if member.status == "restricted" and getattr(member, "is_member", False):
-                    _membership_cache[user_id] = (True, time.time())
-                    return True
-                return False
-            except (asyncio.TimeoutError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError):
-                if retry < 2:
-                    await asyncio.sleep(0.5 * (retry + 1))
-                    continue
-                logger.warning(f"Membership check timed out/network error for user {user_id} in {CHANNEL_ID}")
-                return False
-            except Exception as e:
-                logger.warning(f"Membership check failed for user {user_id} in {CHANNEL_ID}: {e}")
-                return False
+        try:
+            member = await asyncio.wait_for(context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id), timeout=3.0)
+            if member.status in ["member", "administrator", "creator"]:
+                _membership_cache[user_id] = (True, time.time())
+                return True
+            if member.status == "restricted" and getattr(member, "is_member", False):
+                _membership_cache[user_id] = (True, time.time())
+                return True
+            return False
+        except (asyncio.TimeoutError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError) as e:
+            logger.warning(f"Membership check timed out/network error for user {user_id} in {CHANNEL_ID}: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Membership check failed for user {user_id} in {CHANNEL_ID}: {e}")
+            return False
     except Exception:
         return False
 
@@ -938,7 +940,8 @@ async def _process_user_request_internal(update, context):
 
         try:
             try:
-                student_data = await asyncio.wait_for(fetch_student_data(region, registration, first_name, grade), timeout=ZYTE_TOTAL_TIMEOUT * (ZYTE_RETRIES + 1) + 20)
+                timeout_budget = (ZYTE_ATTEMPT_MAX_TIMEOUT * (ZYTE_RETRIES + 1)) + 15
+                student_data = await asyncio.wait_for(fetch_student_data(region, registration, first_name, grade), timeout=timeout_budget)
             except asyncio.TimeoutError:
                 await progress_msg.edit_text(escape_markdown_v2("*Data fetch timed out.*\n\nPlease try again in a moment."), parse_mode='MarkdownV2')
                 return
@@ -1253,10 +1256,39 @@ async def approve_membership(update, context):
         pass
     if await is_user_fully_member(update, context):
         _membership_cache[update.effective_user.id] = (True, time.time())
-        await safe_edit_message(query, "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:", reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
-        return REGION
+        try:
+            lang_msg = await safe_edit_message(query, "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:", reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
+            if lang_msg:
+                context.user_data['message_ids'] = [lang_msg.message_id]
+            return REGION
+        except Exception as e:
+            logger.error(f"Error in approve_membership: {e}")
+            try:
+                new_msg = await query.message.reply_text(
+                    "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:",
+                    reply_markup=language_reply_keyboard(),
+                    parse_mode='MarkdownV2'
+                )
+                context.user_data['message_ids'] = [new_msg.message_id]
+                return REGION
+            except Exception as fallback_error:
+                logger.error(f"Fallback error in approve_membership: {fallback_error}")
+                return ConversationHandler.END
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")], [InlineKeyboardButton("✅ I Joined", callback_data="approve_membership")]])
-    await safe_edit_message(query, escape_markdown_v2(f"❌ *የአባልነት ማረጋገጫ አልተሳካም*\n\nለመቀጠል ቻናሉን መቀላቀል አለብዎት:\n\n📢 *ክራናል:* {CHANNEL_ID}\n\nእባክዎ ቻናሉን ይቀላቀሉ እና 'ተቀላቅማለሁ' እንደገና ይጫኑ።"), reply_markup=markup, parse_mode='MarkdownV2')
+    error_message = (
+        "❌ *የአባልነት ማረጋገጫ አልተሳካም*\n\n"
+        "ለመቀጠል ቻናሉን መቀላቀል አለብዎት:\n\n"
+        f"📢 *ክራናል:* {CHANNEL_ID}\n\n"
+        "እባክዎ ቻናሉን ይቀላቀሉ እና 'ተቀላቅማለሁ' እንደገና ይጫኑ።"
+    )
+    try:
+        await safe_edit_message(query, escape_markdown_v2(error_message), reply_markup=markup, parse_mode='MarkdownV2')
+    except Exception as e:
+        logger.error(f"Error showing membership failure message: {e}")
+        try:
+            await query.message.reply_text(escape_markdown_v2(error_message), reply_markup=markup, parse_mode='MarkdownV2')
+        except Exception as fallback_error:
+            logger.error(f"Fallback error showing membership failure: {fallback_error}")
     return ConversationHandler.END
 
 # ── Admin commands ──
