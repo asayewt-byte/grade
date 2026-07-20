@@ -1498,36 +1498,35 @@ async def main():
 
     asyncio.create_task(check_for_result_updates(application.bot))
     logger.info("Starting bot in polling mode...")
-    polling_retries = 0
-    while True:
+    try:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        await asyncio.Event().wait()
+    except Conflict as e:
+        logger.error(
+            f"Polling conflict detected: {e}. "
+            "This usually means another bot instance is still running."
+        )
+    except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
+        logger.warning(f"Network error during polling: {type(e).__name__}")
+    except Exception:
+        logger.exception("Polling error")
+    finally:
         try:
-            await application.run_polling(drop_pending_updates=True, close_loop=False)
-            break
-        except Conflict as e:
-            polling_retries += 1
-            logger.error(
-                f"Polling conflict detected (attempt {polling_retries}): {e}. "
-                "This usually means another bot instance is still running. "
-                "Retrying in 30 seconds..."
-            )
-            await asyncio.sleep(30)
-            if polling_retries > 20:
-                logger.error("Too many consecutive polling conflicts. Exiting.")
-                break
-        except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
-            polling_retries += 1
-            logger.warning(f"Network error during polling (attempt {polling_retries}): {type(e).__name__} - Restarting in 5 seconds...")
-            await asyncio.sleep(5)
-            if polling_retries > 10:
-                logger.error("Too many consecutive network errors. Exiting.")
-                break
-        except Exception as e:
-            polling_retries += 1
-            logger.error(f"Polling error: {e}")
-            await asyncio.sleep(5)
-            if polling_retries > 10:
-                logger.error("Too many consecutive errors. Exiting.")
-                break
+            if application.updater and application.updater.running:
+                await application.updater.stop()
+        except Exception:
+            pass
+        try:
+            if application.running:
+                await application.stop()
+        except Exception:
+            pass
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
 
 async def check_for_result_updates(bot):
     update_sem = Semaphore(5)
