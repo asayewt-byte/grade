@@ -28,7 +28,7 @@ from functools import wraps
 import os
 import re
 import json
-from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut
 import httpx
 import httpcore
 from urllib.parse import quote, urlparse
@@ -192,7 +192,7 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAEJAdjESb9lAxb2aZ_4pNyPOq7Th7fAY8I")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAH3dFwCN10a0j4gedcDNm4zgckSoEOwnoU")
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 ZYTE_API_KEY = os.getenv("ZYTE_API_KEY","2629765529934bf6bbdc33eafac13539")
@@ -1341,6 +1341,18 @@ async def main():
     while True:
         try:
             await application.run_polling(drop_pending_updates=True)
+            break
+        except Conflict as e:
+            polling_retries += 1
+            logger.error(
+                f"Polling conflict detected (attempt {polling_retries}): {e}. "
+                "This usually means another bot instance is still running. "
+                "Retrying in 30 seconds..."
+            )
+            await asyncio.sleep(30)
+            if polling_retries > 20:
+                logger.error("Too many consecutive polling conflicts. Exiting.")
+                break
         except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
             polling_retries += 1
             logger.warning(f"Network error during polling (attempt {polling_retries}): {type(e).__name__} - Restarting in 5 seconds...")
