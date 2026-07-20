@@ -257,7 +257,7 @@ _rate_limit_warned_windows = set()
 async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False):
     if not zyte_api_key_runtime:
         return None, "zyte_key_missing"
-    payload = {"url": url, "httpResponseBody": True, "geolocation": "ET"}
+    payload = {"url": url, "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
     zyte_headers = {**(headers or {}), **build_basic_auth_headers(zyte_api_key_runtime)}
     session = await get_http_session()
     last_error = None
@@ -578,23 +578,32 @@ async def check_api_credit_status():
     global API_CREDIT_STATUS, LAST_API_CHECK
     try:
         session = await get_http_session()
-        async with session.get("https://api.zyte.com/v1/account", headers=build_basic_auth_headers(zyte_api_key_runtime)) as resp:
-                    if resp.status == 200:
+        payload = {"url": "https://aa.ministry.et/", "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
+        async with session.post(ZYTE_PROXY_URL, json=payload, headers=build_basic_auth_headers(zyte_api_key_runtime)) as resp:
+            if resp.status == 200:
+                try:
+                    data = await resp.json()
+                    if data.get("httpResponseBody"):
                         API_CREDIT_STATUS = "active"
                         LAST_API_CHECK = datetime.now()
                         logger.info("✅ Zyte API is active")
                         return True
-                    if resp.status == 401:
-                        API_CREDIT_STATUS = "invalid_key"
-                        logger.error("❌ Zyte API key is invalid")
-                        return False
-                    if resp.status == 403:
-                        API_CREDIT_STATUS = "insufficient_credits"
-                        logger.error("❌ Zyte API has insufficient credits")
-                        return False
-                    API_CREDIT_STATUS = "unknown"
-                    logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
-                    return True
+                except Exception:
+                    pass
+                API_CREDIT_STATUS = "unknown"
+                logger.warning("⚠️ Zyte API responded 200 but the payload was not usable")
+                return True
+            if resp.status == 401:
+                API_CREDIT_STATUS = "invalid_key"
+                logger.error("❌ Zyte API key is invalid")
+                return False
+            if resp.status == 403:
+                API_CREDIT_STATUS = "insufficient_credits"
+                logger.error("❌ Zyte API has insufficient credits")
+                return False
+            API_CREDIT_STATUS = "unknown"
+            logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
+            return False
     except Exception as e:
         logger.error(f"Error checking API credit status: {e}")
         API_CREDIT_STATUS = "error"
@@ -1192,10 +1201,13 @@ async def receive_feedback(update, context):
 # ── Error handler (suppresses noise) ──
 async def error_handler(update, context):
     error_str = str(context.error).lower()
-    suppressed = ["query is too old", "response timeout expired", "query id is invalid", "chat_write_forbidden", "bot was blocked", "user is deactivated", "chat not found", "kicked from", "restricted", "bot was kicked", "bot was banned", "message is not modified", "message to be replied not found"]
+    suppressed = ["query is too old", "response timeout expired", "query id is invalid", "chat_write_forbidden", "bot was blocked", "user is deactivated", "chat not found", "kicked from", "restricted", "bot was kicked", "bot was banned", "message is not modified", "message to be replied not found", "conflict: terminated by other getupdates request"]
     for phrase in suppressed:
         if phrase in error_str:
             return
+    if isinstance(context.error, Conflict):
+        logger.warning("Polling conflict suppressed: another bot instance is already using getUpdates.")
+        return
     if isinstance(context.error, (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError)):
         logger.warning(f"Network error (suppressed): {context.error}")
         return
