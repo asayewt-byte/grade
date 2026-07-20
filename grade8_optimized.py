@@ -115,6 +115,7 @@ _RESULT_CACHE_TTL = 1800
 _result_cache_timestamps = {}
 
 async def request_phone_number(update, context):
+    global _BOT_USERNAME_CACHE
     user_id = update.effective_user.id
     if await _is_group_non_admin(update):
         return ConversationHandler.END
@@ -302,7 +303,7 @@ REGION, GRADE, REGISTRATION, FIRST_NAME, FEEDBACK = range(5)
 PHONE_NUMBER = 100
 
 GLOBAL_SEMAPHORE = Semaphore(500)
-REQUEST_TIMEOUT = 90
+REQUEST_TIMEOUT = 170
 ZYTE_TOTAL_TIMEOUT = 45
 ZYTE_CONNECT_TIMEOUT = 10
 ZYTE_ATTEMPT_MAX_TIMEOUT = 60
@@ -897,6 +898,7 @@ async def _process_user_request(update, context):
             _active_request_tasks.pop(user_id, None)
 
 async def _process_user_request_internal(update, context):
+    global _BOT_USERNAME_CACHE
     user_id = update.effective_user.id
     if not await check_user_rate_limit(user_id):
         viol = _rate_limit_violations.get(user_id, (0,))[0]
@@ -1371,7 +1373,6 @@ async def main():
     await check_api_credit_status()
 
     application = (ApplicationBuilder().token(TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).pool_timeout(30).build())
-    await application.initialize()
     global telegram_bot
     telegram_bot = application.bot
 
@@ -1422,7 +1423,7 @@ async def main():
     polling_retries = 0
     while True:
         try:
-            await application.run_polling(drop_pending_updates=True)
+            await application.run_polling(drop_pending_updates=True, close_loop=False)
             break
         except Conflict as e:
             polling_retries += 1
