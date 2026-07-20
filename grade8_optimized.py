@@ -192,7 +192,7 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAFVpLSpfHkaubdIZVqXelRHgONsclYyEow")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAEJAdjESb9lAxb2aZ_4pNyPOq7Th7fAY8I")
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 ZYTE_API_KEY = os.getenv("ZYTE_API_KEY","2629765529934bf6bbdc33eafac13539")
