@@ -465,7 +465,6 @@ async def save_user_data(user_id, username=None, first_name=None, last_name=None
         queue_db_write(lambda db: db.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (user_id,)))
         if phone_number:
             queue_db_write(lambda db: db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number)))
-        subscribed_users.add(user_id)
         return True
     except Exception as e:
         logger.error(f"Failed to save user {user_id}: {e}")
