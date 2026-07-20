@@ -34,20 +34,7 @@ import httpcore
 from urllib.parse import quote, urlparse
 import hashlib
 import sqlite3
-from telegram.request import HTTPXRequest
-
-# Custom request handler to suppress transient network errors
-class SilentHTTPXRequest(HTTPXRequest):
-    async def do_request(self, request):
-        """Override to suppress transient network errors"""
-        try:
-            return await super().do_request(request)
-        except (httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
-            # Re-raise but log at debug level instead of error
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.debug(f"Transient network error suppressed: {type(e).__name__}")
-            raise
+from urllib.parse import quote, urlparse
 bot_locked = False
 telegram_bot = None
 
@@ -1303,7 +1290,7 @@ async def main():
     logger.info("🌐 Checking API status...")
     await check_api_credit_status()
 
-    application = (ApplicationBuilder().token(TOKEN).request(SilentHTTPXRequest(read_timeout=30, write_timeout=30, connect_timeout=30, pool_timeout=30)).build())
+    application = (ApplicationBuilder().token(TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).pool_timeout(30).build())
     await application.initialize()
     global telegram_bot
     telegram_bot = application.bot
