@@ -580,38 +580,49 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
 
 async def check_api_credit_status():
     global API_CREDIT_STATUS, LAST_API_CHECK
-    try:
-        session = await get_http_session()
-        payload = {"url": "https://aa.ministry.et/", "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
-        async with session.post(ZYTE_PROXY_URL, json=payload, headers=build_basic_auth_headers(zyte_api_key_runtime)) as resp:
-            if resp.status == 200:
-                try:
-                    data = await resp.json()
-                    if data.get("httpResponseBody"):
-                        API_CREDIT_STATUS = "active"
-                        LAST_API_CHECK = datetime.now()
-                        logger.info("✅ Zyte API is active")
-                        return True
-                except Exception:
-                    pass
+    session = await get_http_session()
+    payload = {"url": "https://aa.ministry.et/", "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
+    headers = build_basic_auth_headers(zyte_api_key_runtime)
+    last_error = None
+    for attempt in range(2):
+        try:
+            health_timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=20)
+            async with session.post(ZYTE_PROXY_URL, json=payload, headers=headers, timeout=health_timeout) as resp:
+                if resp.status == 200:
+                    try:
+                        data = await resp.json()
+                        if data.get("httpResponseBody"):
+                            API_CREDIT_STATUS = "active"
+                            LAST_API_CHECK = datetime.now()
+                            logger.info("✅ Zyte API is active")
+                            return True
+                    except Exception:
+                        pass
+                    API_CREDIT_STATUS = "unknown"
+                    logger.warning("⚠️ Zyte API responded 200 but the payload was not usable")
+                    return True
+                if resp.status == 401:
+                    API_CREDIT_STATUS = "invalid_key"
+                    logger.error("❌ Zyte API key is invalid")
+                    return False
+                if resp.status == 403:
+                    API_CREDIT_STATUS = "insufficient_credits"
+                    logger.error("❌ Zyte API has insufficient credits")
+                    return False
                 API_CREDIT_STATUS = "unknown"
-                logger.warning("⚠️ Zyte API responded 200 but the payload was not usable")
-                return True
-            if resp.status == 401:
-                API_CREDIT_STATUS = "invalid_key"
-                logger.error("❌ Zyte API key is invalid")
+                logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
                 return False
-            if resp.status == 403:
-                API_CREDIT_STATUS = "insufficient_credits"
-                logger.error("❌ Zyte API has insufficient credits")
-                return False
-            API_CREDIT_STATUS = "unknown"
-            logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
-            return False
-    except Exception as e:
-        logger.error(f"Error checking API credit status: {e}")
-        API_CREDIT_STATUS = "error"
-        return False
+        except (asyncio.TimeoutError, aiohttp.ClientError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
+            last_error = e
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+        except Exception as e:
+            last_error = e
+            break
+    API_CREDIT_STATUS = "unknown"
+    logger.warning(f"Zyte health check timed out/failed; continuing startup. Last error: {last_error}")
+    return False
 
 async def fetch_student_data(region: str, registration: str, first_name: str, grade: str = None) -> dict:
     global API_ERROR_COUNT
