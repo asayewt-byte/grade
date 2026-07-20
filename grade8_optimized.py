@@ -1303,7 +1303,7 @@ async def main():
     logger.info("🌐 Checking API status...")
     await check_api_credit_status()
 
-    application = (ApplicationBuilder().token(TOKEN).request(SilentHTTPXRequest(read_timeout=30, write_timeout=30, connect_timeout=30, pool_timeout=30)).read_timeout(30).write_timeout(30).connect_timeout(30).pool_timeout(30).build())
+    application = (ApplicationBuilder().token(TOKEN).request(SilentHTTPXRequest(read_timeout=30, write_timeout=30, connect_timeout=30, pool_timeout=30)).build())
     await application.initialize()
     global telegram_bot
     telegram_bot = application.bot
