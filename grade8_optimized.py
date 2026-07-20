@@ -201,7 +201,7 @@ logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAH3dFwCN10a0j4gedcDNm4zgckSoEOwnoU")
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
-ZYTE_API_KEY = os.getenv("ZYTE_API_KEY","2629765529934bf6bbdc33eafac13539")
+ZYTE_API_KEY = os.getenv("ZYTE_API_KEY","d93c186bb19e4d91acf2cb99cfc8923d")
 zyte_api_key_runtime = ZYTE_API_KEY
 if not ZYTE_API_KEY:
     raise ValueError("ZYTE_API_KEY environment variable is required")
