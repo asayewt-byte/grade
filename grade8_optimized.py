@@ -997,7 +997,17 @@ async def _process_user_request_internal(update, context):
 
             photo_url = student_data.get('student', {}).get('photo', '')
             if photo_url:
-                asyncio.create_task(send_photo_followup(bot=context.bot, chat_id=update.effective_chat.id, photo_url=photo_url, region=region, grade=grade, caption=message, reply_markup=keyboard))
+                context.application.create_task(
+                    send_photo_followup(
+                        bot=context.bot,
+                        chat_id=update.effective_chat.id,
+                        photo_url=photo_url,
+                        region=region,
+                        grade=grade,
+                        caption=message,
+                        reply_markup=keyboard,
+                    )
+                )
 
             ts = datetime.now().isoformat()
             queue_db_write(lambda db: db.execute("INSERT INTO usage_logs (user_id, action, timestamp) VALUES (?, ?, ?)", (user_id, "result_lookup", ts)))
@@ -1376,6 +1386,57 @@ async def handle_general_message(update, context):
         return REGION
     return ConversationHandler.END
 
+async def start_feedback_command(update, context):
+    if await _is_group_non_admin(update):
+        return ConversationHandler.END
+    await update.message.reply_text("📝 Please send your feedback message.")
+    return FEEDBACK
+
+async def _noop_message_handler(update, context):
+    return ConversationHandler.END
+
+async def sponsor_click_handler(update, context):
+    query = update.callback_query
+    try:
+        await query.answer("Thanks for supporting our sponsor.")
+    except Exception:
+        pass
+    try:
+        if query and query.data and query.data.startswith("sponsor_click_"):
+            sponsor_id = int(query.data.split("_")[-1])
+            queue_db_write(lambda db: db.execute("UPDATE sponsors SET clicks = clicks + 1 WHERE id = ?", (sponsor_id,)))
+    except Exception:
+        pass
+
+async def start_aa(update, context):
+    return await start_region_lookup(update, context, 'aa')
+
+async def start_am(update, context):
+    return await start_region_lookup(update, context, 'amhara')
+
+async def start_oro(update, context):
+    return await start_region_lookup(update, context, 'oromia')
+
+async def start_sw(update, context):
+    return await start_region_lookup(update, context, 'sw')
+
+async def start_ce(update, context):
+    return await start_region_lookup(update, context, 'ce')
+
+async def start_se(update, context):
+    return await start_region_lookup(update, context, 'se')
+
+async def start_sidama(update, context):
+    return await start_region_lookup(update, context, 'sidama')
+
+async def start_harari(update, context):
+    return await start_region_lookup(update, context, 'harari')
+
+async def test_command(update, context):
+    logger.info(f"/test from {update.effective_user.id}")
+    if update.message:
+        await update.message.reply_text("✅ Bot is alive")
+
 # ── Main ──
 async def main():
     logger.info("🚀 Initializing database...")
@@ -1396,15 +1457,15 @@ async def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('start', request_phone_number),
-            CommandHandler('feedback', lambda u,c: button_handler(u,c) if u.update.callback_query else None),
-            CommandHandler('aa', lambda u,c: start_region_lookup(u,c,'aa')),
-            CommandHandler('am', lambda u,c: start_region_lookup(u,c,'amhara')),
-            CommandHandler('oro', lambda u,c: start_region_lookup(u,c,'oromia')),
-            CommandHandler('sw', lambda u,c: start_region_lookup(u,c,'sw')),
-            CommandHandler('ce', lambda u,c: start_region_lookup(u,c,'ce')),
-            CommandHandler('se', lambda u,c: start_region_lookup(u,c,'se')),
-            CommandHandler('sidama', lambda u,c: start_region_lookup(u,c,'sidama')),
-            CommandHandler('harari', lambda u,c: start_region_lookup(u,c,'harari')),
+            CommandHandler('feedback', start_feedback_command),
+            CommandHandler('aa', start_aa),
+            CommandHandler('am', start_am),
+            CommandHandler('oro', start_oro),
+            CommandHandler('sw', start_sw),
+            CommandHandler('ce', start_ce),
+            CommandHandler('se', start_se),
+            CommandHandler('sidama', start_sidama),
+            CommandHandler('harari', start_harari),
         ],
         states={
             PHONE_NUMBER: [MessageHandler(filters.CONTACT, receive_phone_number), MessageHandler(filters.TEXT & ~filters.COMMAND, request_phone_number)],
@@ -1413,7 +1474,7 @@ async def main():
             REGISTRATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_registration), CallbackQueryHandler(button_handler)],
             FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_first_name), CallbackQueryHandler(button_handler)],
             FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_feedback), CallbackQueryHandler(button_handler)],
-            ADMIN_FEEDBACK_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: None)],
+            ADMIN_FEEDBACK_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, _noop_message_handler)],
         },
         fallbacks=[],
         allow_reentry=True
@@ -1423,7 +1484,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(select_grade, pattern="^grade_"))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(approve_membership, pattern="^approve_membership$"))
-    application.add_handler(CallbackQueryHandler(lambda u,c: None, pattern="^sponsor_click_"))
+    application.add_handler(CallbackQueryHandler(sponsor_click_handler, pattern="^sponsor_click_"))
     application.add_handler(CommandHandler("stop", stop_fetch))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_general_message))
     application.add_error_handler(error_handler)
@@ -1431,7 +1492,7 @@ async def main():
     for cmd, handler in [("broadcast", None), ("enhanced_broadcast", None), ("reply", None), ("stats", stats), ("enhanced_stats", None), ("lock_bot", None), ("bot_status", None), ("user_stats", None), ("top_users", None), ("admin_help", admin_help), ("unblock", None), ("ban", None), ("unban", None), ("banned", None), ("setlimit", None), ("getlimit", None), ("removelimit", None), ("addsponsor", None), ("listsponsors", None), ("removesponsor", None), ("checkchat", None), ("diagnose", None), ("feedbacks", None), ("apistatus", None), ("apicheck", None), ("checkuser", None), ("persistence", None), ("phone", None), ("status", None), ("allphones", None), ("broadcast_active", None), ("zyte", None), ("backup", None), ("restore", None), ("backup_status", None)]:
         pass  # Handlers kept minimal — the original handlers still work, just skipped here for brevity
 
-    application.add_handler(CommandHandler("test", lambda u,c: print(f"/test from {u.effective_user.id}")))
+    application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("admin_help", admin_help))
 
