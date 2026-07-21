@@ -205,12 +205,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 TOKEN = "7863162641:AAFDYZ_6HZSGS3NEBZDPhIw7WGtPbXgeY2o"
-ZYTE_API_KEY = "PASTE_ZYTE_API_KEY_HERE"
+ZYTE_API_KEY = "2629765529934bf6bbdc33eafac13539"
 zyte_api_key_runtime = ZYTE_API_KEY
-if not ZYTE_API_KEY or ZYTE_API_KEY == "PASTE_ZYTE_API_KEY_HERE":
-    raise ValueError("Set ZYTE_API_KEY in code before running")
+if not ZYTE_API_KEY:
+    zyte_api_key_runtime = ""
+    logging.warning("ZYTE_API_KEY is not set. Bot will start, but result lookups will fail until a valid key is hardcoded.")
 CHANNEL_ID = "@amharictutorialclass"
-REQUIRED_GROUP_ID = ""
+REQUIRED_GROUP_ID = "@ministry2017result"
 REQUIRED_GROUP_LINK = ""
 ADMIN_CHAT_ID = 723559736
 API_ERROR_COUNT = 0
