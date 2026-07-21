@@ -28,15 +28,23 @@ from functools import wraps
 import os
 import re
 import json
-from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut
+from telegram.error import BadRequest, RetryAfter, TimedOut
 import httpx
-import httpcore
 from urllib.parse import quote, urlparse
 import hashlib
 import sqlite3
-from urllib.parse import quote, urlparse
 bot_locked = False
 telegram_bot = None
+_START_TIME = time.time()
+_ERROR_COUNT = 0
+_REQUEST_COUNT = 0
+_REQUEST_COUNT_HOUR = 0
+_REQUEST_HOUR_START = time.time()
+_PEAK_CONCURRENT_TODAY = 0
+_PEAK_RESET_DAY = time.time()
+_QUEUE_PEAK = 0
+_DAILY_USERS_TODAY = set()
+_DAILY_USERS_RESET_DAY = time.time()
 
 PHONE_NUMBER = 100
 
@@ -84,24 +92,24 @@ async def _db_writer_worker():
                 _db_write_queue.task_done()
 
 def queue_db_write(fn):
+    global _QUEUE_PEAK
+    qsize = _db_write_queue.qsize()
+    if qsize > _QUEUE_PEAK:
+        _QUEUE_PEAK = qsize
     _db_write_queue.put_nowait(fn)
 
 # ── Persistent DB connection ──
 _db_conn = None
 _db_lock = asyncio.Lock()
 DB_CONNECT_TIMEOUT = 10
-DB_PATH = os.getenv("BOT_DB_PATH", "/data/bot_data.db" if os.name != "nt" else "bot_data.db")
 
 async def get_db():
     global _db_conn
     if _db_conn is None:
         async with _db_lock:
             if _db_conn is None:
-                db_dir = os.path.dirname(DB_PATH)
-                if db_dir:
-                    os.makedirs(db_dir, exist_ok=True)
                 _db_conn = await asyncio.wait_for(
-                    aiosqlite.connect(DB_PATH, timeout=DB_CONNECT_TIMEOUT),
+                    aiosqlite.connect("bot_data.db", timeout=DB_CONNECT_TIMEOUT),
                     timeout=DB_CONNECT_TIMEOUT + 2
                 )
                 await _db_conn.execute("PRAGMA journal_mode=WAL")
@@ -119,29 +127,27 @@ _RESULT_CACHE_TTL = 1800
 _result_cache_timestamps = {}
 
 async def request_phone_number(update, context):
-    global _BOT_USERNAME_CACHE
     user_id = update.effective_user.id
     if await _is_group_non_admin(update):
         return ConversationHandler.END
     if bot_locked and user_id != ADMIN_CHAT_ID:
         await update.message.reply_text("⚠️ Bot is currently locked by admin. Please try again later.")
         return ConversationHandler.END
-    cached_phone = context.user_data.get('phone_number')
-    if user_id == ADMIN_CHAT_ID and cached_phone == "ADMIN_BYPASS":
-        await update_user_activity(user_id)
-        user_first_name = update.effective_user.first_name or "Admin"
-        await update.message.reply_text(escape_markdown_v2(f"እንኳን ደህና መጡ, {user_first_name}!\n\nየአስተዳደር ፈቃድ ተሰጥቷል\n\nPlease choose your language:"), reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
-        return REGION
     if user_id == ADMIN_CHAT_ID:
         logger.info(f"Admin {user_id} bypassing phone number requirement")
         user_data = await get_user_data(user_id)
         if not user_data:
             await save_user_data(user_id=user_id, username=update.effective_user.username, first_name=update.effective_user.first_name, last_name=update.effective_user.last_name, phone_number="ADMIN_BYPASS")
+            db = await get_db()
+            await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, "ADMIN_BYPASS"))
+            await db.commit()
         await load_user_data_to_context(user_id, context)
         await update_user_activity(user_id)
         user_first_name = update.effective_user.first_name or "Admin"
         await update.message.reply_text(escape_markdown_v2(f"እንኳን ደህና መጡ, {user_first_name}!\n\nየአስተዳደር ፈቃድ ተሰጥቷል\n\nPlease choose your language:"), reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
         return REGION
+    if not await prompt_join_requirements(update, context):
+        return ConversationHandler.END
     is_registered = await is_user_registered(user_id)
     if is_registered:
         await load_user_data_to_context(user_id, context)
@@ -150,6 +156,7 @@ async def request_phone_number(update, context):
         await update.message.reply_text(escape_markdown_v2(f"እንኳን ደህና መጡ, {user_first_name}!\n\nየትምህርት ውጤቶችን ለመፈተሽ የሚያገለግል አጋራዎ\n\nPlease choose your language:"), reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
         return REGION
     if update.effective_chat.type != "private":
+        global _BOT_USERNAME_CACHE
         bot_username = _BOT_USERNAME_CACHE or (await context.bot.get_me()).username
         if not _BOT_USERNAME_CACHE:
             _BOT_USERNAME_CACHE = bot_username
@@ -172,11 +179,16 @@ async def receive_phone_number(update, context):
     if bot_locked and user_id != ADMIN_CHAT_ID:
         await update.message.reply_text("Bot is currently locked by admin. Please try again later.")
         return ConversationHandler.END
+    if user_id != ADMIN_CHAT_ID and not await prompt_join_requirements(update, context):
+        return ConversationHandler.END
     contact = update.message.contact
     if contact and contact.phone_number:
         phone_number = contact.phone_number
         user = update.effective_user
         await save_user_data(user_id=user_id, username=user.username, first_name=user.first_name, last_name=user.last_name, phone_number=phone_number)
+        db = await get_db()
+        await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number))
+        await db.commit()
         context.user_data['phone_number'] = phone_number
         await update.message.reply_text("Thank you. Redirecting to main menu...", reply_markup=ReplyKeyboardRemove())
         full_name = update.effective_user.full_name or "(no name)"
@@ -192,25 +204,105 @@ async def receive_phone_number(update, context):
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Suppress verbose httpx/httpcore logging
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
-logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8014071686:AAH3dFwCN10a0j4gedcDNm4zgckSoEOwnoU")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
-ZYTE_API_KEY = os.getenv("ZYTE_API_KEY","d93c186bb19e4d91acf2cb99cfc8923d")
+TOKEN = "7863162641:AAFDYZ_6HZSGS3NEBZDPhIw7WGtPbXgeY2o"
+ZYTE_API_KEY = os.getenv("ZYTE_API_KEY")
 zyte_api_key_runtime = ZYTE_API_KEY
 if not ZYTE_API_KEY:
     raise ValueError("ZYTE_API_KEY environment variable is required")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@amharictutorialclass")
+REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID", "").strip()
+REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "").strip()
 ADMIN_CHAT_ID = 723559736
-
 API_ERROR_COUNT = 0
 API_ERROR_THRESHOLD = 5
 LAST_API_CHECK = None
 API_CREDIT_STATUS = "unknown"
+SOFT_INVITE_MODE = False
+BASE_DAILY_LIMIT = 3
+LOOKUPS_PER_INVITE = 1
+
+def _normalize_chat_id(chat_id):
+    if isinstance(chat_id, str):
+        s = chat_id.strip()
+        if s and s.lstrip("-").isdigit():
+            try:
+                return int(s)
+            except ValueError:
+                return s
+        return s
+    return chat_id
+
+def _membership_links_markup():
+    buttons = []
+    if CHANNEL_ID:
+        channel_username = str(CHANNEL_ID).strip().replace("@", "")
+        if channel_username:
+            buttons.append([InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}")])
+    if REQUIRED_GROUP_LINK:
+        buttons.append([InlineKeyboardButton("👥 Join Group", url=REQUIRED_GROUP_LINK)])
+    elif REQUIRED_GROUP_ID and str(REQUIRED_GROUP_ID).strip().startswith("@"):
+        group_username = str(REQUIRED_GROUP_ID).strip().replace("@", "")
+        if group_username:
+            buttons.append([InlineKeyboardButton("👥 Join Group", url=f"https://t.me/{group_username}")])
+    elif REQUIRED_GROUP_ID:
+        buttons.append([InlineKeyboardButton("👥 Group Join Help", callback_data="group_join_help")])
+    buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="approve_membership")])
+    return InlineKeyboardMarkup(buttons)
+
+async def get_missing_memberships(bot, user_id: int):
+    required = []
+    if CHANNEL_ID:
+        required.append(("channel", _normalize_chat_id(CHANNEL_ID)))
+    if REQUIRED_GROUP_ID:
+        required.append(("group", _normalize_chat_id(REQUIRED_GROUP_ID)))
+
+    missing = []
+    for label, chat_id in required:
+        try:
+            member = await asyncio.wait_for(bot.get_chat_member(chat_id=chat_id, user_id=user_id), timeout=5.0)
+            if member.status not in ("member", "administrator", "creator"):
+                missing.append(label)
+        except Exception:
+            missing.append(label)
+    return missing
+
+async def prompt_join_requirements(update, context):
+    missing = await get_missing_memberships(context.bot, update.effective_user.id)
+    if not missing:
+        return True
+
+    need_channel = "channel" in missing
+    need_group = "group" in missing
+    if need_channel and need_group:
+        text = (
+            "Most top students in this bot stay in our channel and group for fast result alerts, tips, and updates.\n\n"
+            "You can continue now, but joining keeps you ahead."
+        )
+    elif need_channel:
+        text = (
+            "Students who join our channel usually get updates faster and avoid missing result announcements.\n\n"
+            "You can continue now, but joining is highly recommended."
+        )
+    else:
+        text = (
+            "Our active students' group shares quick help and useful exam updates.\n\n"
+            "You can continue now, but joining gives you an advantage."
+        )
+
+    if need_group and REQUIRED_GROUP_ID and not REQUIRED_GROUP_LINK and not str(REQUIRED_GROUP_ID).startswith("@"):
+        text += "\n\nIf the group has no public link, ask admin for an invite link."
+
+    markup = _membership_links_markup()
+    if update.callback_query:
+        await safe_edit_message(update.callback_query, text, reply_markup=markup)
+    else:
+        msg = update.message or update.effective_message
+        if msg:
+            await msg.reply_text(text, reply_markup=markup)
+    # Soft mode: invite is persuasive, not blocking.
+    if SOFT_INVITE_MODE:
+        return True
+    return False
 
 def require_bot_unlocked(func):
     @wraps(func)
@@ -233,9 +325,19 @@ async def _is_group_non_admin(update) -> bool:
     chat = update.effective_chat
     if not chat or chat.type == "private":
         return False
+    if update.effective_user.id == ADMIN_CHAT_ID:
+        return False
     try:
         member = await chat.get_member(update.effective_user.id)
-        return member.status not in ("administrator", "creator")
+        if member.status not in ("administrator", "creator"):
+            msg = update.message or update.effective_message
+            if msg:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            return True
+        return False
     except Exception:
         return True
 
@@ -248,29 +350,22 @@ _cached_results = {}
 _user_rate_limit_state = {}
 _notified_users = set()
 _unblocked_users = set()
+subscribed_users = set()
 _in_flight_fetches = {}
 _in_flight_lock = asyncio.Lock()
 _rate_limit_violations = {}
 _rate_limit_warned_windows = set()
-_active_request_tasks = {}
-_membership_cache = {}
-_membership_cache_ttl = 300
 
 async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False):
     if not zyte_api_key_runtime:
         return None, "zyte_key_missing"
-    payload = {"url": url, "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
+    payload = {"url": url, "httpResponseBody": True, "geolocation": "ET"}
     zyte_headers = {**(headers or {}), **build_basic_auth_headers(zyte_api_key_runtime)}
     session = await get_http_session()
     last_error = None
     for attempt in range(ZYTE_RETRIES + 1):
         try:
-            per_attempt_timeout = aiohttp.ClientTimeout(
-                total=min(ZYTE_ATTEMPT_MAX_TIMEOUT, ZYTE_TOTAL_TIMEOUT + (attempt * 10)),
-                connect=ZYTE_CONNECT_TIMEOUT,
-                sock_read=min(55, ZYTE_TOTAL_TIMEOUT + (attempt * 8))
-            )
-            async with session.post(ZYTE_PROXY_URL, json=payload, headers=zyte_headers, timeout=per_attempt_timeout) as resp:
+            async with session.post(ZYTE_PROXY_URL, json=payload, headers=zyte_headers) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
                 body = b64decode(data.get("httpResponseBody", ""))
@@ -282,14 +377,12 @@ async def fetch_via_zyte(url: str, headers: dict = None, is_photo: bool = False)
                     return None, f"zyte_json_decode_error: {e}"
         except asyncio.TimeoutError:
             last_error = f"zyte_timeout (attempt {attempt + 1})"
-        except (aiohttp.ClientError, aiohttp.ClientConnectionError, aiohttp.ClientSSLError) as e:
+        except aiohttp.ClientError as e:
             last_error = f"zyte_client_error: {e}"
-        except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
-            last_error = f"zyte_network_error: {type(e).__name__}"
         except Exception as e:
             last_error = f"zyte_error: {e}"
         if attempt < ZYTE_RETRIES:
-            await asyncio.sleep(1.25 ** (attempt + 1))
+            await asyncio.sleep(2 ** attempt)
     return None, last_error
 
 REGION_BASE_URLS = {
@@ -307,10 +400,9 @@ REGION, GRADE, REGISTRATION, FIRST_NAME, FEEDBACK = range(5)
 PHONE_NUMBER = 100
 
 GLOBAL_SEMAPHORE = Semaphore(500)
-REQUEST_TIMEOUT = 170
-ZYTE_TOTAL_TIMEOUT = 45
+REQUEST_TIMEOUT = 90
+ZYTE_TOTAL_TIMEOUT = 35
 ZYTE_CONNECT_TIMEOUT = 10
-ZYTE_ATTEMPT_MAX_TIMEOUT = 60
 ZYTE_RETRIES = 1
 
 ADMIN_FEEDBACK_REPLY = 2000
@@ -402,8 +494,15 @@ async def check_concurrent_limits():
     return _concurrent_sem.locked() is False
 
 async def increment_concurrent_request(user_id):
+    global _PEAK_CONCURRENT_TODAY, _PEAK_RESET_DAY
     await _concurrent_sem.acquire()
     active_users.add(user_id)
+    now = time.time()
+    if now - _PEAK_RESET_DAY > 86400:
+        _PEAK_CONCURRENT_TODAY = len(active_users)
+        _PEAK_RESET_DAY = now
+    elif len(active_users) > _PEAK_CONCURRENT_TODAY:
+        _PEAK_CONCURRENT_TODAY = len(active_users)
 
 async def decrement_concurrent_request(user_id):
     _concurrent_sem.release()
@@ -475,12 +574,11 @@ async def load_subscribers():
 async def save_user_data(user_id, username=None, first_name=None, last_name=None, phone_number=None):
     try:
         ts = datetime.now().isoformat()
-        db = await get_db()
-        await db.execute("INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, phone_number, registration_date, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, phone_number, ts, ts))
-        await db.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (user_id,))
+        queue_db_write(lambda db: db.execute("INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, phone_number, registration_date, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, username, first_name, last_name, phone_number, ts, ts)))
+        queue_db_write(lambda db: db.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (user_id,)))
         if phone_number:
-            await db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number))
-        await db.commit()
+            queue_db_write(lambda db: db.execute("INSERT OR REPLACE INTO phone_numbers (user_id, phone_number) VALUES (?, ?)", (user_id, phone_number)))
+        subscribed_users.add(user_id)
         return True
     except Exception as e:
         logger.error(f"Failed to save user {user_id}: {e}")
@@ -586,51 +684,29 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
 
 async def check_api_credit_status():
     global API_CREDIT_STATUS, LAST_API_CHECK
-    session = await get_http_session()
-    payload = {"url": "https://aa.ministry.et/", "httpResponseBody": True, "geolocation": "ET", "followRedirect": True}
-    headers = build_basic_auth_headers(zyte_api_key_runtime)
-    last_error = None
-    for attempt in range(2):
-        try:
-            health_timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=20)
-            async with session.post(ZYTE_PROXY_URL, json=payload, headers=headers, timeout=health_timeout) as resp:
+    try:
+        session = await get_http_session()
+        async with session.get("https://api.zyte.com/v1/account", headers=build_basic_auth_headers(zyte_api_key_runtime)) as resp:
                 if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        if data.get("httpResponseBody"):
-                            API_CREDIT_STATUS = "active"
-                            LAST_API_CHECK = datetime.now()
-                            logger.info("✅ Zyte API is active")
-                            return True
-                    except Exception:
-                        pass
-                    API_CREDIT_STATUS = "unknown"
-                    logger.warning("⚠️ Zyte API responded 200 but the payload was not usable")
+                    API_CREDIT_STATUS = "active"
+                    LAST_API_CHECK = datetime.now()
                     return True
                 if resp.status == 401:
                     API_CREDIT_STATUS = "invalid_key"
-                    logger.error("❌ Zyte API key is invalid")
                     return False
                 if resp.status == 403:
                     API_CREDIT_STATUS = "insufficient_credits"
-                    logger.error("❌ Zyte API has insufficient credits")
                     return False
                 API_CREDIT_STATUS = "unknown"
-                logger.warning(f"⚠️ Zyte API returned unexpected status: {resp.status}")
-                return False
-        except (asyncio.TimeoutError, aiohttp.ClientError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
-            last_error = e
-            if attempt == 0:
-                await asyncio.sleep(1.0)
-                continue
-        except Exception as e:
-            last_error = e
-            break
-    API_CREDIT_STATUS = "unknown"
-    logger.warning(f"Zyte health check timed out/failed; continuing startup. Last error: {last_error}")
-    return False
+                return True
+    except Exception as e:
+        logger.error(f"Error checking API credit status: {e}")
+        API_CREDIT_STATUS = "error"
+        return False
 
-async def fetch_student_data(region: str, registration: str, first_name: str, grade: str = None) -> dict:
+_ADMIN_SEM = asyncio.Semaphore(1000000)
+
+async def fetch_student_data(region: str, registration: str, first_name: str, grade: str = None, admin_bypass: bool = False) -> dict:
     global API_ERROR_COUNT
     cached = get_cached_student_result(region, registration, first_name)
     if cached:
@@ -649,7 +725,8 @@ async def fetch_student_data(region: str, registration: str, first_name: str, gr
             cached = get_cached_student_result(region, registration, first_name)
             if cached:
                 return cached
-            async with GLOBAL_SEMAPHORE:
+            sem = _ADMIN_SEM if admin_bypass else GLOBAL_SEMAPHORE
+            async with sem:
                 base_url = get_region_base_url(region, grade)
                 if not base_url:
                     return None
@@ -712,16 +789,17 @@ def compress_photo_bytes(photo_data: bytes) -> BytesIO:
     except Exception:
         return BytesIO(photo_data)
 
-async def send_photo_followup(bot, chat_id, photo_url, region, grade, caption, reply_markup):
+async def send_photo_followup(bot, chat_id, photo_url, region, grade, caption, reply_markup, admin_bypass=False):
     try:
-        photo_bytes = await fetch_student_photo(photo_url, region=region, grade=grade)
+        photo_bytes = await fetch_student_photo(photo_url, region=region, grade=grade, admin_bypass=admin_bypass)
         if photo_bytes and photo_bytes.getbuffer().nbytes > 100:
             await bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption[:1024], parse_mode='HTML', reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"Photo follow-up failed: {e}")
 
-async def fetch_student_photo(photo_url: str, context=None, region: str = None, grade: str = None) -> BytesIO:
-    async with GLOBAL_SEMAPHORE:
+async def fetch_student_photo(photo_url: str, context=None, region: str = None, grade: str = None, admin_bypass: bool = False) -> BytesIO:
+    sem = _ADMIN_SEM if admin_bypass else GLOBAL_SEMAPHORE
+    async with sem:
         if not photo_url:
             return None
         resolved = resolve_photo_url(photo_url, region, grade)
@@ -795,25 +873,8 @@ async def format_student_results(student_data: dict, bot_username: str = "", reg
 
 async def is_user_fully_member(update, context):
     try:
-        user_id = update.effective_user.id
-        cached = _membership_cache.get(user_id)
-        if cached and time.time() - cached[1] <= _membership_cache_ttl:
-            return True
-        try:
-            member = await asyncio.wait_for(context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id), timeout=3.0)
-            if member.status in ["member", "administrator", "creator"]:
-                _membership_cache[user_id] = (True, time.time())
-                return True
-            if member.status == "restricted" and getattr(member, "is_member", False):
-                _membership_cache[user_id] = (True, time.time())
-                return True
-            return False
-        except (asyncio.TimeoutError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError) as e:
-            logger.warning(f"Membership check timed out/network error for user {user_id} in {CHANNEL_ID}: {e}")
-            return False
-        except Exception as e:
-            logger.warning(f"Membership check failed for user {user_id} in {CHANNEL_ID}: {e}")
-            return False
+        missing = await get_missing_memberships(context.bot, update.effective_user.id)
+        return len(missing) == 0
     except Exception:
         return False
 
@@ -836,24 +897,17 @@ async def notify_admins(context_or_bot, message: str):
 
 async def can_bot_send_messages(bot, chat_id):
     try:
-        for retry in range(2):
-            try:
-                member = await asyncio.wait_for(bot.get_chat_member(chat_id=chat_id, user_id=bot.id), timeout=5.0)
-                return getattr(member, 'can_send_messages', True)
-            except (asyncio.TimeoutError, httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError):
-                if retry < 1:
-                    await asyncio.sleep(0.5)
-                    continue
-                return True
-            except Exception:
-                return True
-    except Exception:
+        member = await asyncio.wait_for(bot.get_chat_member(chat_id=chat_id, user_id=bot.id), timeout=5.0)
+        return getattr(member, 'can_send_messages', True)
+    except (asyncio.TimeoutError, Exception):
         return True
 
 def require_membership(func):
     @wraps(func)
     async def wrapper(update, context, *args, **kwargs):
         user_id = update.effective_user.id
+        if user_id == ADMIN_CHAT_ID:
+            return await func(update, context, *args, **kwargs)
         if await is_user_banned(user_id):
             msg = "🚫 እርስዎ ይህን ቦት ለመጠቀም ተከልክለዋል። @Tegene ን ያናግሩ።"
             if update.message:
@@ -861,13 +915,25 @@ def require_membership(func):
             elif update.callback_query:
                 await update.callback_query.answer(msg, show_alert=True)
             return ConversationHandler.END
-        if not await is_user_fully_member(update, context):
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("Join Channel", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")], [InlineKeyboardButton("I Joined / ተቀላቅያለሁ", callback_data="approve_membership")]])
-            msg = f"*የቀን ገደብ*\n\nይህን ቦት ለመጠቀም ከታች ያሉትን Channel መቀላቀል አለብዎት:\n\n*Channel:* {CHANNEL_ID}\n\nእባክዎ ቻናሉን ይቀላቀሉ እና 'ተቀላቅያለሁ' ይጫኑ።"
+        chat = update.effective_chat
+        if chat and chat.type != "private":
+            global _BOT_USERNAME_CACHE
+            uname = _BOT_USERNAME_CACHE
+            if not uname:
+                try:
+                    _BOT_USERNAME_CACHE = (await context.bot.get_me()).username
+                    uname = _BOT_USERNAME_CACHE
+                except Exception:
+                    uname = "ministrygrade8ethiobot"
+            link = f"https://t.me/{uname}"
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("Start Bot / ቦቱን ይክፈቱ", url=link)]])
+            msg = "Please use this bot in a private message. Click below to start:"
             if update.message:
-                await update.message.reply_text(escape_markdown_v2(msg), reply_markup=markup, parse_mode='MarkdownV2')
+                await update.message.reply_text(msg, reply_markup=markup)
             elif update.callback_query:
-                await safe_edit_message(update.callback_query, escape_markdown_v2(msg), reply_markup=markup, parse_mode='MarkdownV2')
+                await safe_edit_message(update.callback_query, msg, reply_markup=markup)
+            return ConversationHandler.END
+        if not await prompt_join_requirements(update, context):
             return ConversationHandler.END
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -891,8 +957,6 @@ async def get_today_lookups(user_id):
 
 async def _process_user_request(update, context):
     user_id = update.effective_user.id
-    current_task = asyncio.current_task()
-    _active_request_tasks[user_id] = current_task
     try:
         await asyncio.wait_for(_process_user_request_internal(update, context), timeout=REQUEST_TIMEOUT)
     except asyncio.TimeoutError:
@@ -901,32 +965,34 @@ async def _process_user_request(update, context):
             await update.message.reply_text(escape_markdown_v2("⏰ *Request timed out!*\n\n🔄 *Please try again in a moment*"), parse_mode='MarkdownV2')
         except Exception:
             pass
-    except asyncio.CancelledError:
-        logger.info(f"Request cancelled for user {user_id}")
-        raise
     except Exception as e:
         logger.error(f"Error in request processing: {e}")
         try:
             await update.message.reply_text(escape_markdown_v2("*An error occurred.*\n\nPlease try again later."), parse_mode='MarkdownV2')
         except Exception:
             pass
-    finally:
-        if _active_request_tasks.get(user_id) is current_task:
-            _active_request_tasks.pop(user_id, None)
 
 async def _process_user_request_internal(update, context):
-    global _BOT_USERNAME_CACHE
+    global _BOT_USERNAME_CACHE, _REQUEST_COUNT, _REQUEST_COUNT_HOUR, _REQUEST_HOUR_START
+    _REQUEST_COUNT += 1
+    now = time.time()
+    if now - _REQUEST_HOUR_START > 3600:
+        _REQUEST_COUNT_HOUR = 0
+        _REQUEST_HOUR_START = now
+    _REQUEST_COUNT_HOUR += 1
     user_id = update.effective_user.id
-    if not await check_user_rate_limit(user_id):
-        viol = _rate_limit_violations.get(user_id, (0,))[0]
-        remaining = AUTO_BAN_VIOLATION_THRESHOLD - viol
-        msg = "🚫 *You have been auto-banned for repeated violations.*\n\n📞 Contact @Tegene to appeal." if await is_user_banned(user_id) else (f"🚫 *Rate limit exceeded!*\n\n⏳ *Please wait before trying again*\n⚠️ *{remaining} more violation\\(s\\) = auto\\-ban*" if remaining > 0 else "🚫 *Rate limit exceeded!*\n\n⏳ *Please wait a moment before trying again*")
-        await update.message.reply_text(escape_markdown_v2(msg), parse_mode='MarkdownV2')
-        return
-    if not await check_concurrent_limits():
-        await update.message.reply_text(escape_markdown_v2("🚫 *Server is busy!*\n\n⏳ *Too many users right now, please wait and try again*"), parse_mode='MarkdownV2')
-        return
-    await increment_concurrent_request(user_id)
+    is_admin = user_id == ADMIN_CHAT_ID
+    if not is_admin:
+        if not await check_user_rate_limit(user_id):
+            viol = _rate_limit_violations.get(user_id, (0,))[0]
+            remaining = AUTO_BAN_VIOLATION_THRESHOLD - viol
+            msg = "🚫 *You have been auto-banned for repeated violations.*\n\n📞 Contact @Tegene to appeal." if await is_user_banned(user_id) else (f"🚫 *Rate limit exceeded!*\n\n⏳ *Please wait before trying again*\n⚠️ *{remaining} more violation\\(s\\) = auto\\-ban*" if remaining > 0 else "🚫 *Rate limit exceeded!*\n\n⏳ *Please wait a moment before trying again*")
+            await update.message.reply_text(escape_markdown_v2(msg), parse_mode='MarkdownV2')
+            return
+        if not await check_concurrent_limits():
+            await update.message.reply_text(escape_markdown_v2("🚫 *Server is busy!*\n\n⏳ *Too many users right now, please wait and try again*"), parse_mode='MarkdownV2')
+            return
+        await increment_concurrent_request(user_id)
     try:
         await update_user_activity(user_id)
         user_data = context.user_data
@@ -936,17 +1002,37 @@ async def _process_user_request_internal(update, context):
         grade = user_data.get('grade') if region in ['aa', 'oromia', 'sidama', 'se', 'ce', 'amhara'] else None
 
         if user_id != ADMIN_CHAT_ID:
-            today_lookups = await get_today_lookups(user_id)
-            referral_count = await get_referral_count(user_id)
-            db = await get_db()
-            async with db.execute("SELECT daily_limit FROM user_custom_limits WHERE user_id = ?", (user_id,)) as cur:
-                custom = await cur.fetchone()
-            BASE_DAILY_LIMIT = 6
-            LOOKUPS_PER_INVITE = 2
-            allowed = (custom[0] if custom else BASE_DAILY_LIMIT) + referral_count * LOOKUPS_PER_INVITE
-            if today_lookups >= allowed:
-                await update.message.reply_text(escape_markdown_v2("🎉 *እንኳን ደስ አለዎት! ዛሬ 6 ተማሪ ውጤት አይተዋል!*\n\n*ተጨማሪ ውጤት ለማግኘት በኋላ ይሞክሩ ወይም አስተዳዳሪን ያነጋግሩ።*"), parse_mode='MarkdownV2')
-                return
+            # Group admins skip daily limit
+            chat = update.effective_chat
+            is_group_admin = False
+            if chat and chat.type != "private":
+                try:
+                    member = await chat.get_member(user_id)
+                    is_group_admin = member.status in ("administrator", "creator")
+                except Exception:
+                    pass
+            if not is_group_admin:
+                today_lookups = await get_today_lookups(user_id)
+                referral_count = await get_referral_count(user_id)
+                db = await get_db()
+                async with db.execute("SELECT daily_limit FROM user_custom_limits WHERE user_id = ?", (user_id,)) as cur:
+                    custom = await cur.fetchone()
+                allowed = (custom[0] if custom else BASE_DAILY_LIMIT) + referral_count * LOOKUPS_PER_INVITE
+                if today_lookups >= allowed:
+                    uname = _BOT_USERNAME_CACHE or (await context.bot.get_me()).username
+                    if not _BOT_USERNAME_CACHE:
+                        _BOT_USERNAME_CACHE = uname
+                    link = f"https://t.me/{uname}?start={user_id}"
+                    await update.message.reply_text(
+                        escape_markdown_v2(f"✅ *You used today's free lookups.*\n\n"
+                            f"Daily free lookups: *{BASE_DAILY_LIMIT}*\n"
+                            f"You can come back tomorrow for more free checks.\n\n"
+                            f"Want extra lookups today? Invite friends for bonus:\n"
+                            f"Each friend = *{LOOKUPS_PER_INVITE}* extra lookup\n\n"
+                            f"Your invite link:\n{link}\n\n"
+                            f"👥 Invited so far: {referral_count}"),
+                        parse_mode='MarkdownV2', disable_web_page_preview=True)
+                    return
 
         if not region or not registration or not first_name:
             await update.message.reply_text(escape_markdown_v2("Missing required information. Please start over."), parse_mode='MarkdownV2')
@@ -959,8 +1045,7 @@ async def _process_user_request_internal(update, context):
 
         try:
             try:
-                timeout_budget = (ZYTE_ATTEMPT_MAX_TIMEOUT * (ZYTE_RETRIES + 1)) + 15
-                student_data = await asyncio.wait_for(fetch_student_data(region, registration, first_name, grade), timeout=timeout_budget)
+                student_data = await asyncio.wait_for(fetch_student_data(region, registration, first_name, grade, admin_bypass=is_admin), timeout=ZYTE_TOTAL_TIMEOUT * (ZYTE_RETRIES + 1) + 20)
             except asyncio.TimeoutError:
                 await progress_msg.edit_text(escape_markdown_v2("*Data fetch timed out.*\n\nPlease try again in a moment."), parse_mode='MarkdownV2')
                 return
@@ -986,8 +1071,6 @@ async def _process_user_request_internal(update, context):
                 await progress_msg.edit_text(escape_markdown_v2(msg), parse_mode='MarkdownV2')
                 return
 
-            if not _BOT_USERNAME_CACHE:
-                _BOT_USERNAME_CACHE = (await context.bot.get_me()).username
             message, sponsor_id, sponsor_contact = await format_student_results(student_data, _BOT_USERNAME_CACHE, region)
             lang = context.user_data.get('language', 'en')
             keyboard = result_keyboard_amharic(message, sponsor_id, sponsor_contact) if lang == 'am' else result_keyboard(message, sponsor_id, sponsor_contact)
@@ -995,19 +1078,17 @@ async def _process_user_request_internal(update, context):
             _rate_limit_violations.pop(user_id, None)
             await progress_msg.edit_text(message, parse_mode='HTML', reply_markup=keyboard)
 
+            global _DAILY_USERS_TODAY, _DAILY_USERS_RESET_DAY
+            now = time.time()
+            if now - _DAILY_USERS_RESET_DAY > 86400:
+                _DAILY_USERS_TODAY = {user_id}
+                _DAILY_USERS_RESET_DAY = now
+            else:
+                _DAILY_USERS_TODAY.add(user_id)
+
             photo_url = student_data.get('student', {}).get('photo', '')
             if photo_url:
-                context.application.create_task(
-                    send_photo_followup(
-                        bot=context.bot,
-                        chat_id=update.effective_chat.id,
-                        photo_url=photo_url,
-                        region=region,
-                        grade=grade,
-                        caption=message,
-                        reply_markup=keyboard,
-                    )
-                )
+                asyncio.create_task(send_photo_followup(bot=context.bot, chat_id=update.effective_chat.id, photo_url=photo_url, region=region, grade=grade, caption=message, reply_markup=keyboard, admin_bypass=is_admin))
 
             ts = datetime.now().isoformat()
             queue_db_write(lambda db: db.execute("INSERT INTO usage_logs (user_id, action, timestamp) VALUES (?, ?, ?)", (user_id, "result_lookup", ts)))
@@ -1024,17 +1105,8 @@ async def _process_user_request_internal(update, context):
         except Exception:
             pass
     finally:
-        await decrement_concurrent_request(user_id)
-
-async def stop_fetch(update, context):
-    user_id = update.effective_user.id
-    current_task = _active_request_tasks.get(user_id)
-    if current_task and not current_task.done():
-        current_task.cancel()
-        await update.message.reply_text("🛑 Fetch stopped immediately.")
-        return ConversationHandler.END
-    await update.message.reply_text("ℹ️ No active fetch is running right now.")
-    return ConversationHandler.END
+        if not is_admin:
+            await decrement_concurrent_request(user_id)
 
 def validate_registration(registration: str) -> bool:
     return re.match(r"^\d{6,10}$", registration) is not None
@@ -1178,6 +1250,18 @@ async def get_first_name(update, context):
         return ConversationHandler.END
     return FIRST_NAME
 
+async def start_feedback_entry(update, context):
+    """Entry point handler for clicking feedback when no conversation is active."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    lang = context.user_data.get('language', 'en')
+    text = "💬 \n\nPlease send your feedback in the next message and we will review it shortly." if lang == "en" else "💬 \n\nአስተያየትዎን በሚቀጥለው መልእክት ውስጥ ይላኩ እና በቅርብ ጊዜ እንመለከታለን።"
+    await safe_edit_message(query, text, parse_mode=ParseMode.MARKDOWN)
+    return FEEDBACK
+
 async def button_handler(update, context):
     user_id = update.effective_user.id
     if await _is_group_non_admin(update):
@@ -1194,6 +1278,11 @@ async def button_handler(update, context):
         await query.answer()
     except Exception:
         pass
+
+    # Ensure membership confirmation callbacks are not swallowed by this generic handler.
+    if query.data == "approve_membership":
+        return await approve_membership(update, context)
+
     lang = user_data.get('language', 'en')
     chat_id = update.effective_chat.id
 
@@ -1258,16 +1347,14 @@ async def receive_feedback(update, context):
 
 # ── Error handler (suppresses noise) ──
 async def error_handler(update, context):
+    global _ERROR_COUNT
+    _ERROR_COUNT += 1
     error_str = str(context.error).lower()
-    suppressed = ["query is too old", "response timeout expired", "query id is invalid", "chat_write_forbidden", "bot was blocked", "user is deactivated", "chat not found", "kicked from", "restricted", "bot was kicked", "bot was banned", "message is not modified", "message to be replied not found", "conflict: terminated by other getupdates request"]
+    suppressed = ["query is too old", "response timeout expired", "query id is invalid", "chat_write_forbidden", "bot was blocked", "user is deactivated", "chat not found", "kicked from", "restricted", "bot was kicked", "bot was banned", "message is not modified", "message to be replied not found"]
     for phrase in suppressed:
         if phrase in error_str:
             return
-    if isinstance(context.error, Conflict):
-        logger.warning("Polling conflict suppressed: another bot instance is already using getUpdates.")
-        return
-    if isinstance(context.error, (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError)):
-        logger.warning(f"Network error (suppressed): {context.error}")
+    if isinstance(context.error, httpx.TransportError):
         return
     logger.error("Exception while handling an update:", exc_info=context.error)
     if update and hasattr(update, 'effective_chat') and update.effective_chat:
@@ -1275,7 +1362,11 @@ async def error_handler(update, context):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=escape_markdown_v2("❌ An error occurred. Please try again later."), parse_mode='MarkdownV2')
         except Exception:
             pass
-    await notify_admins(context, f"🚨 Bot Error: {str(context.error)}")
+    tb = "".join(__import__('traceback').format_exception(type(context.error), context.error, context.error.__traceback__))
+    msg = f"\u26a0\ufe0f <b>Bot Error</b>\n<code>{tb[:3500]}</code>"
+    if len(tb) > 3500:
+        msg += f"\n\n<i>...truncated ({len(tb)} chars total)</i>"
+    await notify_admins(context, msg)
 
 async def approve_membership(update, context):
     query = update.callback_query
@@ -1284,40 +1375,35 @@ async def approve_membership(update, context):
     except Exception:
         pass
     if await is_user_fully_member(update, context):
-        _membership_cache[update.effective_user.id] = (True, time.time())
-        try:
-            lang_msg = await safe_edit_message(query, "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:", reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
-            if lang_msg:
-                context.user_data['message_ids'] = [lang_msg.message_id]
-            return REGION
-        except Exception as e:
-            logger.error(f"Error in approve_membership: {e}")
-            try:
-                new_msg = await query.message.reply_text(
-                    "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:",
-                    reply_markup=language_reply_keyboard(),
-                    parse_mode='MarkdownV2'
-                )
-                context.user_data['message_ids'] = [new_msg.message_id]
-                return REGION
-            except Exception as fallback_error:
-                logger.error(f"Fallback error in approve_membership: {fallback_error}")
-                return ConversationHandler.END
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")], [InlineKeyboardButton("✅ I Joined", callback_data="approve_membership")]])
-    error_message = (
-        "❌ *የአባልነት ማረጋገጫ አልተሳካም*\n\n"
-        "ለመቀጠል ቻናሉን መቀላቀል አለብዎት:\n\n"
-        f"📢 *ክራናል:* {CHANNEL_ID}\n\n"
-        "እባክዎ ቻናሉን ይቀላቀሉ እና 'ተቀላቅማለሁ' እንደገና ይጫኑ።"
-    )
+        await safe_edit_message(query, "🌍 Please choose your language:\n\n🌍 እባክዎ ቋንቋዎን ይምረጡ:", reply_markup=language_reply_keyboard(), parse_mode='MarkdownV2')
+        return REGION
+    missing = await get_missing_memberships(context.bot, update.effective_user.id)
+    if SOFT_INVITE_MODE:
+        soft_text = (
+            "Nice. You're all set to continue.\n\n"
+            "If you join our updates channel/group, you will get faster notices and helpful tips used by many students."
+        )
+        await safe_edit_message(query, soft_text, reply_markup=language_reply_keyboard())
+        return REGION
+
+    missing_labels = []
+    if "channel" in missing:
+        missing_labels.append(f"📢 Channel: {CHANNEL_ID}")
+    if "group" in missing:
+        missing_labels.append(f"👥 Group: {REQUIRED_GROUP_ID}")
+    lines = "\n".join(missing_labels) if missing_labels else "Required memberships not satisfied."
+    text = f"❌ Membership verification failed.\n\nPlease join the required chat(s) and tap 'I Joined' again.\n\n{lines}"
+    if "group" in missing and REQUIRED_GROUP_ID and not REQUIRED_GROUP_LINK and not str(REQUIRED_GROUP_ID).startswith("@"):
+        text += "\n\nThis group may be private. Ask admin for an invite link."
+    await safe_edit_message(query, text, reply_markup=_membership_links_markup())
+    return ConversationHandler.END
+
+async def group_join_help(update, context):
+    query = update.callback_query
     try:
-        await safe_edit_message(query, escape_markdown_v2(error_message), reply_markup=markup, parse_mode='MarkdownV2')
-    except Exception as e:
-        logger.error(f"Error showing membership failure message: {e}")
-        try:
-            await query.message.reply_text(escape_markdown_v2(error_message), reply_markup=markup, parse_mode='MarkdownV2')
-        except Exception as fallback_error:
-            logger.error(f"Fallback error showing membership failure: {fallback_error}")
+        await query.answer("This group may be private. Ask admin for an invite link or set REQUIRED_GROUP_LINK.", show_alert=True)
+    except Exception:
+        pass
     return ConversationHandler.END
 
 # ── Admin commands ──
@@ -1335,6 +1421,90 @@ async def stats(update, context):
         await update.message.reply_text("❌ Error retrieving stats.")
         return
     await update.message.reply_text(f"📊 *Bot Statistics*\n👥 Total Users: {stats['total_users']}\n🔍 Total Lookups: {stats['total_lookups']}\n📈 Today: {stats['today_lookups']}\n🕒 Active (24h): {stats['active_users_24h']}\n📝 Feedback: {stats['total_feedback']}\n🔒 {'🔴 Locked' if stats['bot_locked'] else '🟢 Unlocked'}", parse_mode='Markdown')
+
+async def status(update, context):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+    uptime = time.time() - _START_TIME
+    days, rem = divmod(uptime, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    qsize = _db_write_queue.qsize() if _db_write_queue else 0
+    concurrent = _concurrent_sem._value if hasattr(_concurrent_sem, '_value') else '?'
+    total = 500 - concurrent if isinstance(concurrent, int) else '?'
+    try:
+        db_size = os.path.getsize("bot_data.db") / 1024 / 1024
+        db_size_str = f"{db_size:.1f} MB"
+    except Exception:
+        db_size_str = "?"
+    text = (
+        f"⚡ <b>Live Status</b>\n\n"
+        f"⏱ <b>Uptime:</b> {int(days)}d {int(hours)}h {int(mins)}m {int(secs)}s\n"
+        f"📊 <b>Requests:</b> {_REQUEST_COUNT} total | {_REQUEST_COUNT_HOUR}/hr\n"
+        f"❌ <b>Errors:</b> {_ERROR_COUNT}\n"
+        f"👥 <b>Users today:</b> {len(_DAILY_USERS_TODAY)}\n"
+        f"📈 <b>Peak concurrent:</b> {_PEAK_CONCURRENT_TODAY}\n"
+        f"📬 <b>DB queue peak:</b> {_QUEUE_PEAK}\n"
+        f"🔗 <b>Active:</b> {len(active_users)} now | {total}/500\n"
+        f"🔒 <b>Bot locked:</b> {'Yes' if bot_locked else 'No'}\n"
+        f"💾 <b>Cache:</b> {len(_cached_results)} entries\n"
+        f"🗄 <b>DB size:</b> {db_size_str}\n"
+    )
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        text += f"🧠 <b>Memory:</b> {mem.rss / 1024 / 1024:.1f} MB"
+    except ImportError:
+        text += f"🧠 <i>install psutil for memory info</i>"
+    await update.message.reply_text(text, parse_mode='HTML')
+
+# ── Sponsor admin commands ──
+
+async def addsponsor(update, context):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /addsponsor <name> <message> [region]\nRegion is optional (aa, oromia, etc). Leave empty for all regions.")
+        return
+    name = args[0]
+    region = args[-1] if len(args) > 2 and args[-1] in ['aa','oromia','amhara','sidama','se','ce','sw','harari'] else None
+    msg = ' '.join(args[1:]) if not region else ' '.join(args[1:-1])
+    ts = datetime.now().isoformat()
+    db = await get_db()
+    await db.execute("INSERT INTO sponsors (name, message, region, created_at) VALUES (?, ?, ?, ?)", (name, msg, region, ts))
+    await db.commit()
+    await update.message.reply_text(f"✅ Sponsor '{name}' added successfully.")
+
+async def listsponsors(update, context):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+    db = await get_db()
+    cur = await db.execute("SELECT id, name, message, region, active, impressions, clicks, created_at FROM sponsors ORDER BY id")
+    rows = await cur.fetchall()
+    if not rows:
+        await update.message.reply_text("No sponsors found.")
+        return
+    lines = []
+    for r in rows:
+        status = "🟢" if r['active'] else "🔴"
+        region = r['region'] or "all"
+        lines.append(f"{status} <b>#{r['id']}</b> {r['name']} ({region})\n   {r['message'][:60]}\n   👁 {r['impressions']} | 👆 {r['clicks']} | {r['created_at'][:10]}")
+    await update.message.reply_text("<b>📢 Sponsors</b>\n\n" + "\n\n".join(lines), parse_mode='HTML')
+
+async def removesponsor(update, context):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /removesponsor <id>")
+        return
+    sid = args[0]
+    db = await get_db()
+    await db.execute("UPDATE sponsors SET active = 0 WHERE id = ?", (sid,))
+    await db.commit()
+    await update.message.reply_text(f"✅ Sponsor #{sid} deactivated.")
 
 # ── Region direct command handlers ──
 
@@ -1370,6 +1540,31 @@ def result_keyboard_amharic(message="", sponsor_id=None, sponsor_contact=None):
     btns.append([InlineKeyboardButton("ወደ ምናሌ ተመለስ", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(btns)
 
+@require_membership
+async def direct_region_lookup(update, context, region, grade=None):
+    """Handle commands like /aa8 12345 Abebe — direct lookup skipping conversation."""
+    if await _is_group_non_admin(update):
+        return ConversationHandler.END
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("Usage: /<command> <registration> <first_name>\nExample: /aa8 12345678 Abebe")
+        return ConversationHandler.END
+    registration = args[0].strip()
+    if not validate_registration(registration):
+        await update.message.reply_text("Invalid registration number. Must be 6-10 digits.")
+        return ConversationHandler.END
+    first_name = ' '.join(args[1:]).strip()
+    if not first_name:
+        await update.message.reply_text("Please provide a first name.")
+        return ConversationHandler.END
+    context.user_data['region'] = region
+    if grade:
+        context.user_data['grade'] = grade
+    context.user_data['registration'] = registration
+    context.user_data['first_name'] = first_name.lower()
+    await fetch_results(update, context)
+    return ConversationHandler.END
+
 async def handle_general_message(update, context):
     if await _is_group_non_admin(update):
         return ConversationHandler.END
@@ -1386,57 +1581,6 @@ async def handle_general_message(update, context):
         return REGION
     return ConversationHandler.END
 
-async def start_feedback_command(update, context):
-    if await _is_group_non_admin(update):
-        return ConversationHandler.END
-    await update.message.reply_text("📝 Please send your feedback message.")
-    return FEEDBACK
-
-async def _noop_message_handler(update, context):
-    return ConversationHandler.END
-
-async def sponsor_click_handler(update, context):
-    query = update.callback_query
-    try:
-        await query.answer("Thanks for supporting our sponsor.")
-    except Exception:
-        pass
-    try:
-        if query and query.data and query.data.startswith("sponsor_click_"):
-            sponsor_id = int(query.data.split("_")[-1])
-            queue_db_write(lambda db: db.execute("UPDATE sponsors SET clicks = clicks + 1 WHERE id = ?", (sponsor_id,)))
-    except Exception:
-        pass
-
-async def start_aa(update, context):
-    return await start_region_lookup(update, context, 'aa')
-
-async def start_am(update, context):
-    return await start_region_lookup(update, context, 'amhara')
-
-async def start_oro(update, context):
-    return await start_region_lookup(update, context, 'oromia')
-
-async def start_sw(update, context):
-    return await start_region_lookup(update, context, 'sw')
-
-async def start_ce(update, context):
-    return await start_region_lookup(update, context, 'ce')
-
-async def start_se(update, context):
-    return await start_region_lookup(update, context, 'se')
-
-async def start_sidama(update, context):
-    return await start_region_lookup(update, context, 'sidama')
-
-async def start_harari(update, context):
-    return await start_region_lookup(update, context, 'harari')
-
-async def test_command(update, context):
-    logger.info(f"/test from {update.effective_user.id}")
-    if update.message:
-        await update.message.reply_text("✅ Bot is alive")
-
 # ── Main ──
 async def main():
     logger.info("🚀 Initializing database...")
@@ -1451,21 +1595,35 @@ async def main():
     await check_api_credit_status()
 
     application = (ApplicationBuilder().token(TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).pool_timeout(30).build())
+    await application.initialize()
     global telegram_bot
     telegram_bot = application.bot
 
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('start', request_phone_number),
-            CommandHandler('feedback', start_feedback_command),
-            CommandHandler('aa', start_aa),
-            CommandHandler('am', start_am),
-            CommandHandler('oro', start_oro),
-            CommandHandler('sw', start_sw),
-            CommandHandler('ce', start_ce),
-            CommandHandler('se', start_se),
-            CommandHandler('sidama', start_sidama),
-            CommandHandler('harari', start_harari),
+            CallbackQueryHandler(start_feedback_entry, pattern="^(feedback|feedback_amharic)$"),
+            CommandHandler('aa', lambda u,c: start_region_lookup(u,c,'aa')),
+            CommandHandler('am', lambda u,c: start_region_lookup(u,c,'amhara')),
+            CommandHandler('oro', lambda u,c: start_region_lookup(u,c,'oromia')),
+            CommandHandler('sw', lambda u,c: start_region_lookup(u,c,'sw')),
+            CommandHandler('ce', lambda u,c: start_region_lookup(u,c,'ce')),
+            CommandHandler('se', lambda u,c: start_region_lookup(u,c,'se')),
+            CommandHandler('sidama', lambda u,c: start_region_lookup(u,c,'sidama')),
+            CommandHandler('harari', lambda u,c: start_region_lookup(u,c,'harari')),
+            # Shortcut commands: /<region><grade> <registration> <name>
+            CommandHandler('aa6', lambda u,c: direct_region_lookup(u,c,'aa','6')),
+            CommandHandler('aa8', lambda u,c: direct_region_lookup(u,c,'aa','8')),
+            CommandHandler('am6', lambda u,c: direct_region_lookup(u,c,'amhara','6')),
+            CommandHandler('am8', lambda u,c: direct_region_lookup(u,c,'amhara','8')),
+            CommandHandler('oro6', lambda u,c: direct_region_lookup(u,c,'oromia','6')),
+            CommandHandler('oro8', lambda u,c: direct_region_lookup(u,c,'oromia','8')),
+            CommandHandler('sidama6', lambda u,c: direct_region_lookup(u,c,'sidama','6')),
+            CommandHandler('sidama8', lambda u,c: direct_region_lookup(u,c,'sidama','8')),
+            CommandHandler('se6', lambda u,c: direct_region_lookup(u,c,'se','6')),
+            CommandHandler('se8', lambda u,c: direct_region_lookup(u,c,'se','8')),
+            CommandHandler('ce6', lambda u,c: direct_region_lookup(u,c,'ce','6')),
+            CommandHandler('ce8', lambda u,c: direct_region_lookup(u,c,'ce','8')),
         ],
         states={
             PHONE_NUMBER: [MessageHandler(filters.CONTACT, receive_phone_number), MessageHandler(filters.TEXT & ~filters.COMMAND, request_phone_number)],
@@ -1474,59 +1632,32 @@ async def main():
             REGISTRATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_registration), CallbackQueryHandler(button_handler)],
             FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_first_name), CallbackQueryHandler(button_handler)],
             FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_feedback), CallbackQueryHandler(button_handler)],
-            ADMIN_FEEDBACK_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, _noop_message_handler)],
+            ADMIN_FEEDBACK_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: None)],
         },
         fallbacks=[],
         allow_reentry=True
     )
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(select_region, pattern="^region_"))
-    application.add_handler(CallbackQueryHandler(select_grade, pattern="^grade_"))
-    application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(approve_membership, pattern="^approve_membership$"))
-    application.add_handler(CallbackQueryHandler(sponsor_click_handler, pattern="^sponsor_click_"))
-    application.add_handler(CommandHandler("stop", stop_fetch))
+    application.add_handler(CallbackQueryHandler(group_join_help, pattern="^group_join_help$"))
+    application.add_handler(CallbackQueryHandler(lambda u,c: None, pattern="^sponsor_click_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_general_message))
     application.add_error_handler(error_handler)
 
     for cmd, handler in [("broadcast", None), ("enhanced_broadcast", None), ("reply", None), ("stats", stats), ("enhanced_stats", None), ("lock_bot", None), ("bot_status", None), ("user_stats", None), ("top_users", None), ("admin_help", admin_help), ("unblock", None), ("ban", None), ("unban", None), ("banned", None), ("setlimit", None), ("getlimit", None), ("removelimit", None), ("addsponsor", None), ("listsponsors", None), ("removesponsor", None), ("checkchat", None), ("diagnose", None), ("feedbacks", None), ("apistatus", None), ("apicheck", None), ("checkuser", None), ("persistence", None), ("phone", None), ("status", None), ("allphones", None), ("broadcast_active", None), ("zyte", None), ("backup", None), ("restore", None), ("backup_status", None)]:
         pass  # Handlers kept minimal — the original handlers still work, just skipped here for brevity
 
-    application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CommandHandler("test", lambda u,c: print(f"/test from {u.effective_user.id}")))
     application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("admin_help", admin_help))
+    application.add_handler(CommandHandler("addsponsor", addsponsor))
+    application.add_handler(CommandHandler("listsponsors", listsponsors))
+    application.add_handler(CommandHandler("removesponsor", removesponsor))
 
     asyncio.create_task(check_for_result_updates(application.bot))
     logger.info("Starting bot in polling mode...")
-    try:
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        await asyncio.Event().wait()
-    except Conflict as e:
-        logger.error(
-            f"Polling conflict detected: {e}. "
-            "This usually means another bot instance is still running."
-        )
-    except (httpx.ReadError, httpx.ConnectError, httpcore.ReadError, httpcore.ConnectError, httpcore.WriteError) as e:
-        logger.warning(f"Network error during polling: {type(e).__name__}")
-    except Exception:
-        logger.exception("Polling error")
-    finally:
-        try:
-            if application.updater and application.updater.running:
-                await application.updater.stop()
-        except Exception:
-            pass
-        try:
-            if application.running:
-                await application.stop()
-        except Exception:
-            pass
-        try:
-            await application.shutdown()
-        except Exception:
-            pass
+    await application.run_polling(drop_pending_updates=True)
 
 async def check_for_result_updates(bot):
     update_sem = Semaphore(5)
@@ -1544,7 +1675,7 @@ async def check_for_result_updates(bot):
                     if h != last_hash:
                         msg, _, _ = await format_student_results(result, region=region)
                         try:
-                            await bot.send_message(chat_id=user_id, text="🎉 Your result has been updated!\n\n" + msg, parse_mode='MarkdownV2')
+                            await bot.send_message(chat_id=user_id, text="🎉 Your result has been updated!\n\n" + msg)
                         except Exception as e:
                             logger.error(f"Failed to notify user {user_id}: {e}")
                         queue_db_write(lambda db: db.execute("UPDATE subscriptions SET last_result_hash = ? WHERE user_id = ? AND region = ? AND registration = ? AND first_name = ?", (h, user_id, region, registration, first_name)))
