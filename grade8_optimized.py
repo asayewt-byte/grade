@@ -205,13 +205,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 TOKEN = "7863162641:AAFDYZ_6HZSGS3NEBZDPhIw7WGtPbXgeY2o"
-ZYTE_API_KEY = os.getenv("ZYTE_API_KEY")
+ZYTE_API_KEY = "PASTE_ZYTE_API_KEY_HERE"
 zyte_api_key_runtime = ZYTE_API_KEY
-if not ZYTE_API_KEY:
-    raise ValueError("ZYTE_API_KEY environment variable is required")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@amharictutorialclass")
-REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID", "").strip()
-REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "").strip()
+if not ZYTE_API_KEY or ZYTE_API_KEY == "PASTE_ZYTE_API_KEY_HERE":
+    raise ValueError("Set ZYTE_API_KEY in code before running")
+CHANNEL_ID = "@amharictutorialclass"
+REQUIRED_GROUP_ID = ""
+REQUIRED_GROUP_LINK = ""
 ADMIN_CHAT_ID = 723559736
 API_ERROR_COUNT = 0
 API_ERROR_THRESHOLD = 5
