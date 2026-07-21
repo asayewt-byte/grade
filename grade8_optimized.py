@@ -28,6 +28,7 @@ from functools import wraps
 import os
 import re
 import json
+import html
 from telegram.error import BadRequest, RetryAfter, TimedOut
 import httpx
 from urllib.parse import quote, urlparse
@@ -894,6 +895,12 @@ async def notify_admins(context_or_bot, message: str):
                     await bot.send_message(chat_id=admin_id, text=message, parse_mode='HTML')
                 except Exception:
                     pass
+            elif isinstance(e, BadRequest) and "parse entities" in str(e).lower():
+                # Fallback to plain text if traceback contains HTML-like tokens.
+                try:
+                    await bot.send_message(chat_id=admin_id, text=message[:4000])
+                except Exception:
+                    pass
             else:
                 logger.error(f"Failed to notify admin {admin_id}: {e}")
 
@@ -1365,7 +1372,8 @@ async def error_handler(update, context):
         except Exception:
             pass
     tb = "".join(__import__('traceback').format_exception(type(context.error), context.error, context.error.__traceback__))
-    msg = f"\u26a0\ufe0f <b>Bot Error</b>\n<code>{tb[:3500]}</code>"
+    escaped_tb = html.escape(tb[:3500])
+    msg = f"\u26a0\ufe0f <b>Bot Error</b>\n<code>{escaped_tb}</code>"
     if len(tb) > 3500:
         msg += f"\n\n<i>...truncated ({len(tb)} chars total)</i>"
     await notify_admins(context, msg)
@@ -1659,7 +1667,7 @@ async def main():
 
     asyncio.create_task(check_for_result_updates(application.bot))
     logger.info("Starting bot in polling mode...")
-    await application.run_polling(drop_pending_updates=True)
+    await application.run_polling(drop_pending_updates=True, close_loop=False)
 
 async def check_for_result_updates(bot):
     update_sem = Semaphore(5)
