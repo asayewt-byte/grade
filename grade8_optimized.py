@@ -102,6 +102,7 @@ def queue_db_write(fn):
 _db_conn = None
 _db_lock = asyncio.Lock()
 DB_CONNECT_TIMEOUT = 10
+DB_PATH = "/data/bot_data.db" if os.path.isdir("/data") else "bot_data.db"
 
 async def get_db():
     global _db_conn
@@ -109,7 +110,7 @@ async def get_db():
         async with _db_lock:
             if _db_conn is None:
                 _db_conn = await asyncio.wait_for(
-                    aiosqlite.connect("bot_data.db", timeout=DB_CONNECT_TIMEOUT),
+                    aiosqlite.connect(DB_PATH, timeout=DB_CONNECT_TIMEOUT),
                     timeout=DB_CONNECT_TIMEOUT + 2
                 )
                 await _db_conn.execute("PRAGMA journal_mode=WAL")
@@ -1434,7 +1435,7 @@ async def status(update, context):
     concurrent = _concurrent_sem._value if hasattr(_concurrent_sem, '_value') else '?'
     total = 500 - concurrent if isinstance(concurrent, int) else '?'
     try:
-        db_size = os.path.getsize("bot_data.db") / 1024 / 1024
+        db_size = os.path.getsize(DB_PATH) / 1024 / 1024
         db_size_str = f"{db_size:.1f} MB"
     except Exception:
         db_size_str = "?"
